@@ -25,6 +25,8 @@ jobs:
       POSITRON_BUILD_NUMBER: ${{ inputs.build_number }}
       BUILD_SOURCEVERSION: ${{ inputs.commit }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      npm_config_arch: arm64
       NODE_OPTIONS: --max-old-space-size=8192
     steps:
       - name: Check out this repository
@@ -38,6 +40,11 @@ jobs:
           repository: posit-dev/positron
           ref: ${{ inputs.commit }}
           path: positron
+          submodules: recursive
+
+      - name: Fetch ark submodule history and tags
+        working-directory: positron/extensions/positron-r/ark
+        run: git fetch --unshallow --tags || git fetch --tags
 
       - uses: actions/setup-node@v4
         with:
