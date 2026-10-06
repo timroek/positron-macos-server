@@ -15,19 +15,78 @@ on:
 permissions:
   contents: read
 
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+  POSITRON_BUILD_NUMBER: ${{ inputs.build_number }}
+  BUILD_SOURCEVERSION: ${{ inputs.commit }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+  MANGLER_WORKER_POOL_SIZE: 1
+
 jobs:
+  # The TypeScript compile of src/ (gulp task compile-build-without-mangling)
+  # needs more than 8 GB of JavaScript heap. The macOS arm64 runner has only
+  # 7 GB of RAM and runs out of memory there, so this platform-independent step
+  # runs on a Linux runner (16 GB RAM, plus extra swap) and hands its output
+  # (out-build/) to the macOS job.
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      npm_config_arch: x64
+    steps:
+      - name: Add swap space
+        run: |
+          sudo fallocate -l 12G /swapfile-extra
+          sudo chmod 600 /swapfile-extra
+          sudo mkswap /swapfile-extra
+          sudo swapon /swapfile-extra
+          free -h
+
+      - name: Check out Positron at the requested commit
+        uses: actions/checkout@v4
+        with:
+          repository: posit-dev/positron
+          ref: ${{ inputs.commit }}
+          path: positron
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: positron/.nvmrc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: positron
+        run: |
+          npm install --prefix build --fetch-timeout 120000
+          npm ci --fetch-timeout 120000
+
+      - name: Compile src (without mangling)
+        working-directory: positron
+        # Same as `npm run gulp`, but with a larger heap than the script's 8 GB.
+        run: node --experimental-strip-types --max-old-space-size=12288 ./node_modules/gulp/bin/gulp.js compile-build-without-mangling
+
+      - name: Archive out-build
+        working-directory: positron
+        run: tar -czf ../out-build.tar.gz out-build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: out-build
+          path: out-build.tar.gz
+          retention-days: 1
+
   build:
+    needs: compile
     runs-on: macos-15
     timeout-minutes: 150
     env:
-      ELECTRON_SKIP_BINARY_DOWNLOAD: 1
-      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
-      POSITRON_BUILD_NUMBER: ${{ inputs.build_number }}
-      BUILD_SOURCEVERSION: ${{ inputs.commit }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
       npm_config_arch: arm64
-      NODE_OPTIONS: --max-old-space-size=8192
     steps:
       - name: Check out this repository
         uses: actions/checkout@v4
@@ -60,11 +119,32 @@ jobs:
           npm install --prefix build --fetch-timeout 120000
           npm ci --fetch-timeout 120000
 
-      - name: Build the remote server
+      - uses: actions/download-artifact@v4
+        with:
+          name: out-build
+
+      - name: Restore out-build
+        run: tar -xzf out-build.tar.gz -C positron
+
+      # The remaining steps of Positron's `vscode-reh-darwin-arm64-min` task
+      # (build/gulpfile.reh.ts), each in its own process to keep memory low.
+      # The unregistered `clean-extensions-build` task is a plain rm here.
+      - name: Build extensions
         working-directory: positron
-        env:
-          MANGLER_WORKER_POOL_SIZE: 1
-        run: npm run gulp vscode-reh-darwin-arm64
+        run: |
+          rm -rf .build/extensions
+          npm run gulp compile-non-native-extensions-build
+          npm run gulp compile-copilot-extension-build
+          npm run gulp compile-extension-media-build
+          npm run gulp copy-extension-binaries
+
+      - name: Bundle and minify the server
+        working-directory: positron
+        run: npm run gulp minify-vscode-reh
+
+      - name: Package the server for darwin-arm64
+        working-directory: positron
+        run: npm run gulp vscode-reh-darwin-arm64-min-ci
 
       - name: Package with license and notices
         run: |
