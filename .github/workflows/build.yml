@@ -136,6 +136,9 @@ jobs:
       # The remaining steps of Positron's `vscode-reh-darwin-arm64-min` task
       # (build/gulpfile.reh.ts), each in its own process to keep memory low.
       # The unregistered `clean-extensions-build` task is a plain rm here.
+      # `copy-extension-binaries` cannot run as a gulp task on its own: it does
+      # not wait for its copy streams, so gulp reports "did not complete". Call
+      # the same Positron function directly; Node exits once the copies finish.
       - name: Build extensions
         working-directory: positron
         run: |
@@ -143,7 +146,9 @@ jobs:
           npm run gulp compile-non-native-extensions-build
           npm run gulp compile-copilot-extension-build
           npm run gulp compile-extension-media-build
-          npm run gulp copy-extension-binaries
+          node --experimental-strip-types --input-type=module -e "const ext = await import('./build/lib/extensions.ts'); await ext.copyExtensionBinaries('.build/extensions');"
+          echo "Copied extension binaries:"
+          find .build/extensions -type f -perm -u+x \( -name 'ark' -o -name 'kcserver' -o -name 'pet' \) -print
 
       - name: Bundle and minify the server
         working-directory: positron
