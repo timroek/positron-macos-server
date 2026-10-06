@@ -1,0 +1,44 @@
+name: Inspect a server build
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: ID of the build run whose artifact to inspect
+        required: true
+      commit:
+        description: Positron commit of that build
+        required: true
+        default: 467ff390dd8b4ffc8972ebb84d9e05a1fd5a4fe2
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: positron-reh-darwin-arm64-${{ inputs.commit }}
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show the artifact structure
+        run: |
+          set -x
+          ls -la
+          tar -xzf positron-reh-darwin-arm64-*.tar.gz
+          du -sh vscode-reh-darwin-arm64
+          ls -la vscode-reh-darwin-arm64
+          ls -la vscode-reh-darwin-arm64/bin vscode-reh-darwin-arm64/bin/* || true
+          file vscode-reh-darwin-arm64/node
+          head -c 600 vscode-reh-darwin-arm64/LICENSE.txt; echo
+          jq '{nameShort, applicationName, version, positronVersion, positronBuildNumber, commit, quality, serverApplicationName, serverDataFolderName}' vscode-reh-darwin-arm64/product.json
+          jq '{name, version}' vscode-reh-darwin-arm64/package.json
+          for f in vscode-reh-darwin-arm64/bin/*; do [ -f "$f" ] && { echo "== $f"; head -40 "$f"; }; done
+          ls vscode-reh-darwin-arm64/extensions
+          ls -la vscode-reh-darwin-arm64/extensions/positron-r || true
+          find vscode-reh-darwin-arm64/extensions -type f -perm -u+x \( -name 'ark' -o -name 'kcserver' -o -name 'pet' \) -exec file {} \;
+          find vscode-reh-darwin-arm64/node_modules -name '*.node' -exec file {} \; | head -40
