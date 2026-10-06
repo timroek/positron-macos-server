@@ -1,0 +1,73 @@
+name: Build Positron remote server for macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Positron commit to build (must match the installed Positron app)
+        required: true
+        default: 467ff390dd8b4ffc8972ebb84d9e05a1fd5a4fe2
+      build_number:
+        description: Positron build number of that release
+        required: true
+        default: "2"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 150
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+      POSITRON_BUILD_NUMBER: ${{ inputs.build_number }}
+      BUILD_SOURCEVERSION: ${{ inputs.commit }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      NODE_OPTIONS: --max-old-space-size=8192
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          path: notices
+
+      - name: Check out Positron at the requested commit
+        uses: actions/checkout@v4
+        with:
+          repository: posit-dev/positron
+          ref: ${{ inputs.commit }}
+          path: positron
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: positron/.nvmrc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: positron
+        run: |
+          npm install --prefix build --fetch-timeout 120000
+          npm ci --fetch-timeout 120000
+
+      - name: Build the remote server
+        working-directory: positron
+        env:
+          MANGLER_WORKER_POOL_SIZE: 1
+        run: npm run gulp vscode-reh-darwin-arm64
+
+      - name: Package with license and notices
+        run: |
+          OUT=vscode-reh-darwin-arm64
+          cp positron/LICENSE.txt "$OUT/LICENSE.txt"
+          cp notices/README.md "$OUT/BUILD-NOTICE.md"
+          tar -czf positron-reh-darwin-arm64-${{ inputs.commit }}.tar.gz "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: positron-reh-darwin-arm64-${{ inputs.commit }}
+          path: positron-reh-darwin-arm64-*.tar.gz
+          retention-days: 30
