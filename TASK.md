@@ -57,4 +57,71 @@ Write the report concisely, in English. Append it to the end of this file under 
 
 ## Result
 
-(not yet run)
+**Outcome: success.** Run: https://github.com/timroek/positron-macos-server/actions/runs/37535699882
+(run 5, commit `ad47fd7`). Artifact: `positron-reh-darwin-arm64-467ff390dd8b4ffc8972ebb84d9e05a1fd5a4fe2`
+(746 MB zip containing the `.tar.gz`; 2.3 GB unpacked; kept for 30 days).
+
+### Runs
+
+1. 37514052540: cancelled on purpose (before this task).
+2. 37515139613: `npm run gulp vscode-reh-darwin-arm64` on `macos-15` ran out of
+   JavaScript heap (8 GB limit; the runner has 7 GB RAM) in the emit of
+   `compile-src`.
+3. 37525014733: new Linux compile job failed in `npm ci` (`kerberos` needs
+   `gssapi/gssapi.h`).
+4. 37529064236: compile and extension builds passed; `copy-extension-binaries`
+   failed as a standalone gulp task ("did not complete").
+5. 37535699882: success.
+
+### Workflow changes (`.github/workflows/build.yml`)
+
+- New `compile` job on `ubuntu-24.04` (16 GB RAM plus 12 GB extra swap,
+  Linux build headers installed) runs `compile-build-without-mangling` with a
+  12 GB heap and uploads `out-build/` (platform-independent JavaScript).
+- The `macos-15` job restores `out-build/`, then runs the remaining steps of
+  Positron's `vscode-reh-darwin-arm64-min` task one by one:
+  `compile-non-native-extensions-build`, `compile-copilot-extension-build`,
+  `compile-extension-media-build`, Positron's `copyExtensionBinaries()` called
+  directly from Node, `minify-vscode-reh`, `vscode-reh-darwin-arm64-min-ci`.
+  As a result the server code is minified (not mangled).
+- Packaging unchanged: `LICENSE.txt` and `BUILD-NOTICE.md` (this README) are
+  added to the tarball.
+- New `.github/workflows/inspect.yml` prints the structure of a build artifact.
+- Documented under "Modifications" in `README.md`.
+
+### Modifications to Positron's source
+
+None.
+
+### Artifact structure
+
+- Top-level folder: `vscode-reh-darwin-arm64/` with `LICENSE.txt` (Posit
+  copyright, Elastic License 2.0), `BUILD-NOTICE.md`, `NOTICE`, `node`,
+  `bin/`, `extensions/` (68 entries), `node_modules/`, `out/`, `quarto/`,
+  `resources/`, `package.json`, `product.json`.
+- `node`: present, Mach-O 64-bit arm64.
+- `bin/`: `positron-server` (runs `node out/server-main.js`),
+  `remote-cli/positron`, `helpers/browser.sh`. There is no `code-server` and
+  no top-level `server.sh`.
+- `product.json`: `commit` `467ff390dd8b4ffc8972ebb84d9e05a1fd5a4fe2`,
+  `positronVersion` 2026.09.1, `positronBuildNumber` 2, `version` 1.130.0,
+  `serverApplicationName` `positron-server`, `serverDataFolderName`
+  `.positron-server`, `quality` `dailies`.
+- R support: included. `extensions/positron-r` (with `dist/`) and
+  `extensions/positron-r/resources/ark/ark` (Mach-O arm64). Also present:
+  `positron-supervisor` with `kcserver` (arm64), `positron-python` with `pet`
+  (universal), `positron-reticulate`.
+- Native modules in `node_modules` (node-pty, @parcel/watcher, spdlog,
+  sqlite3, ...) are arm64.
+
+### What the owner must do
+
+- Download the artifact from the run page (it expires after 30 days) and
+  install it as `~/.positron-server/bin/467ff390dd8b4ffc8972ebb84d9e05a1fd5a4fe2/`
+  (the contents of `vscode-reh-darwin-arm64/`), or serve it under the
+  `serverDownloadUrlTemplate` name `positron-reh-darwin-arm64-<version>.tar.gz`.
+- Check that `quality` (`dailies` in the source build) is acceptable to the
+  installed app; the client matches on the commit, but compare with the
+  app's own `product.json` if the connection is refused.
+- Test a real connection from Positron's Remote - SSH; this was not tested
+  here.
