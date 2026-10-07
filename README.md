@@ -54,13 +54,25 @@ What changed:
 ark's `LICENSE` and the patch are included in the build under
 `licenses/ark/`. All copyright and licence notices are kept.
 
-### No GitHub Copilot extension
+### No AI components in the server
 
-The built-in GitHub Copilot Chat extension (`extensions/copilot`) is removed
-from the server before packaging, and the workflow fails if any extension
-folder whose name contains "copilot" remains. Reason: in the setup this build
-is made for, every extension in the server runs as a user with access to
-sensitive data, and no AI component may run on that side.
+Removed from the server before packaging:
+
+- `extensions/copilot`: the built-in GitHub Copilot Chat extension;
+- `extensions/next-edit-suggestions`: Posit AI next-edit suggestions;
+- `node_modules/@github/copilot*`: the GitHub Copilot packages (such as
+  `@github/copilot-darwin-arm64`), used only by the agent host
+  (`out/vs/platform/agentHost/node/agentHostMain.js`). Disable the agent host
+  in Positron with `"chat.agentHost.enabled": false`.
+
+The workflow fails if any of these, or any extension or `node_modules`
+package whose name contains "copilot", remains. It then starts the server
+with a temporary connection token and checks that it listens, so nothing the
+server needs at startup was removed.
+
+Reason: in the setup this build is made for, every component in the server
+runs as the user who owns sensitive data, and no AI component may run on that
+side.
 
 ### Build
 

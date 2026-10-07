@@ -231,19 +231,61 @@ jobs:
         working-directory: positron
         run: npm run gulp vscode-reh-darwin-arm64-min-ci
 
-      # No AI component may run in the server (see README.md): remove the
-      # built-in GitHub Copilot Chat extension and fail if any extension
-      # folder with "copilot" in its name is left.
-      - name: Remove the Copilot extension
+      # No AI component may run in the server (see README.md). Remove the
+      # GitHub Copilot Chat extension, the Copilot packages used by the agent
+      # host and Posit's next-edit-suggestions extension, and fail if any of
+      # them, or any extension or module with "copilot" in its name, is left.
+      - name: Remove AI components
         run: |
           OUT=vscode-reh-darwin-arm64
-          rm -rf "$OUT/extensions/copilot"
-          left=$(find "$OUT/extensions" -mindepth 1 -maxdepth 1 -type d -iname '*copilot*')
+          echo "Core files that reference @github/copilot:"
+          grep -rl --include='*.js' '@github/copilot' "$OUT/out" || echo "(none)"
+          rm -rf "$OUT/extensions/copilot" "$OUT/extensions/next-edit-suggestions"
+          find "$OUT/node_modules/@github" -mindepth 1 -maxdepth 1 -iname 'copilot*' -print -exec rm -rf {} + 2>/dev/null || true
+
+          left=$( {
+            find "$OUT/extensions" -mindepth 1 -maxdepth 1 \( -iname '*copilot*' -o -name next-edit-suggestions \)
+            find "$OUT" -type d -path '*/node_modules/*' -iname '*copilot*'
+          } )
           if [ -n "$left" ]; then
-            echo "::error::Copilot extension folders still present: $left"
+            echo "::error::AI components still present:"
+            echo "$left"
             exit 1
           fi
-          echo "No Copilot extension folders in $OUT/extensions"
+          echo "No Copilot or next-edit-suggestions components left in $OUT"
+
+      # The server must still start without them.
+      - name: Check that the server starts
+        run: |
+          OUT=vscode-reh-darwin-arm64
+          "$OUT/bin/positron-server" --help | head -5
+          log="$RUNNER_TEMP/server.log"
+          "$OUT/bin/positron-server" --host 127.0.0.1 --port 0 \
+            --connection-token "ci-$RANDOM$RANDOM" --accept-server-license-terms \
+            --server-data-dir "$RUNNER_TEMP/server-data" >"$log" 2>&1 &
+          pid=$!
+          port=
+          for _ in $(seq 1 60); do
+            port=$(sed -n 's/.*Extension host agent listening on \([0-9]*\).*/\1/p' "$log" | head -1)
+            [ -n "$port" ] && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          sleep 5
+          status=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/version" || true)
+          alive=no; kill -0 "$pid" 2>/dev/null && alive=yes
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          cat "$log"
+          echo "Port: ${port:-none}, HTTP /version: $status, still running after start: $alive"
+          if [ -z "$port" ] || [ "$alive" != yes ]; then
+            echo "::error::The server did not start"
+            exit 1
+          fi
+          if grep -iE 'cannot find (module|package).*copilot|copilot.*(not found|cannot find)' "$log"; then
+            echo "::error::The server log shows a missing Copilot module"
+            exit 1
+          fi
 
       - name: Package with license and notices
         run: |

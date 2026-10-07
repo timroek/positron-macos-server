@@ -53,6 +53,24 @@ contains "copilot" remains. Reason: in the owner's setup every extension in the
 server runs as a user that has access to sensitive data, and no AI component may
 run on that side. Record this under "Modifications" in `README.md`.
 
+## Addition 2: remove the remaining AI components
+
+The owner decided that the server build must also leave out:
+
+- `node_modules/@github/copilot-darwin-arm64` and any other
+  `node_modules/@github/copilot*` package. They are only referenced by the agent
+  host (`out/vs/platform/agentHost/node/agentHostMain.js`), which the owner
+  disables with `chat.agentHost.enabled: false`;
+- the built-in extension `extensions/next-edit-suggestions` (Posit AI next-edit
+  suggestions).
+
+Extend the post-packaging check so the build fails if any of these, or any
+extension or module whose name contains "copilot", remains. Verify in the
+workflow that the server still starts after the removal. Document both
+removals and the reason under "Modifications" in `README.md`. Reason: every
+component in this server runs as the user that owns sensitive data, and no AI
+component may run on that side.
+
 ## Constraints
 
 - **Repository:** only touch this repository. Do not open issues or pull requests on `posit-dev/ark`, `posit-dev/positron` or any other repository.
