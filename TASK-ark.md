@@ -98,4 +98,132 @@ Append the report at the end of this file under "Result" and push it. Include:
 
 ## Result
 
-(not yet run)
+**Outcome: success.** Run 9: https://github.com/timroek/positron-macos-server/actions/runs/37605720596
+(commit `a4cc57e`). Artifact: `positron-reh-darwin-arm64-467ff390dd8b4ffc8972ebb84d9e05a1fd5a4fe2`
+(631 MB, kept until 2026-11-06). The earlier artifact of `TASK.md` (run 5) has
+the unpatched ark and the AI components; do not use it.
+
+Runs for this task: 6 and 7 cancelled on purpose (superseded by the Copilot
+additions), 8 failed in the new AI check (it found more Copilot modules, see
+below), 9 succeeded.
+
+### Version check
+
+Positron `467ff390` pins the ark submodule at `5564f488e539cfdd344f583a7aeb40250f7d20d3`;
+`crates/ark/Cargo.toml` says 0.1.252 and the commit is 266 commits after tag
+`0.1.252`, so the bundled ark is `0.1.252+266.5564f48` as stated.
+
+### The patch (`patches/ark-peer-check.patch`)
+
+- New `crates/ark/src/peer_check.rs`: `is_same_user_peer(server, local, peer)`
+  looks for the client end of the connection, a TCP socket with local address
+  `peer` and remote address `local`, among the sockets of processes owned by
+  ark's effective uid. macOS: `proc_listpids(PROC_UID_ONLY, euid)`,
+  `proc_pidinfo(PROC_PIDLISTFDS)`, `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`
+  (the `socket_fdinfo` structs are declared `#[repr(C)]` from
+  `<sys/proc_info.h>`, since `libc` lacks them). Linux: owner uid from
+  `/proc/net/tcp{,6}`. No match or any error: reject and log. Other platforms:
+  unchanged behaviour.
+- DAP (`dap_server.rs`): rejected connections are closed and the accept loop
+  continues, so reconnects keep working.
+- LSP (`lsp/backend.rs`): accepts in a loop until a connection passes the
+  check (previously the first connection was served, so another user could
+  also block the real client).
+- Help proxy (`help_proxy.rs`): `HttpServer::on_connect` runs the check once
+  per connection; a middleware answers `403` to every request on a connection
+  that failed or was never checked.
+- ark is built from source on the macOS runner (`cargo build --release`,
+  `ARK_BUILD_VERSION=0.1.252+266`, so it reports the same version), signed ad
+  hoc; Positron's install script picks up `target/release/ark` ("Using locally
+  built Ark"). The packaging step checks that the shipped
+  `extensions/positron-r/resources/ark/ark` is byte-identical to that build,
+  re-signs it and verifies the signature (`valid on disk`). ark's `LICENSE`
+  and the patch ship under `licenses/ark/`.
+
+### Tests (all passed on macOS in run 9, and on Linux locally)
+
+- Unit: `test_accepts_connection_from_same_process`,
+  `test_rejects_unknown_peer_port` (unknown peer port and wrong listener port
+  both rejected), `test_help_proxy_serves_same_user` (not 403), and on Linux
+  `test_linux_find_owner`.
+- Real connections from another process: same user (`runner`) accepted,
+  `sudo -u nobody` rejected ("Connection from nobody: rejected as expected").
+- Help proxy end to end: `GET /dev-figure?file=<probe>.txt` returned `200` to
+  the same user and `403` to `nobody`. The `200` also demonstrates the
+  original issue: without the patch any local user could read files through
+  this endpoint.
+
+### The two HTTP listeners
+
+1. `HTTP/1.1` with a `date` header: **ark's help proxy** (actix-web,
+   `help_proxy.rs`). Besides proxying to R's help server it has
+   `/dev-figure?file=<path>` (returns the raw bytes of any file the session
+   owner can read, MIME type from the extension) and `/preview?file=<path>`
+   (renders any `.Rd` file through R). Now protected by the peer check.
+2. `HTTP/1.0`: **R's own dynamic help server** (`tools::startDynamicHelp`,
+   started by ark's `.ps.help.startOrReconnectToHelpServer`; R
+   `dynamicHelp.R` and `Rhttpd.c`). Not patched (part of R). To any local
+   user it serves: files under the session `tempdir()` via `/session/<path>`
+   (`..` segments are removed, so it stays in the temp dir apart from
+   symlinks); help pages, vignettes, NEWS, DESCRIPTION and other files of
+   installed packages; it **runs installed packages' example code**
+   (`/library/<pkg>/Example/<topic>?local=FALSE` evaluates in the global
+   environment) and demos (`/library/<pkg>/Demo/<name>`); and it calls
+   `/custom/<name>` handlers registered by loaded packages. Mitigation:
+   `R_DISABLE_HTTPD=1` in user B's environment (for example `~/.Renviron`).
+   R then does not start the server, ark skips the proxy too, and the Help
+   pane shows no R help. Longer term ark could serve help in-process
+   (`tools:::httpd()`) without a TCP server (see `SECURITY-NOTE.md`).
+
+### AI components removed (additions 1 and 2)
+
+- Removed: `extensions/copilot`, `extensions/next-edit-suggestions`, and
+  every `node_modules` package with "copilot" in its name:
+  `@github/copilot`, `@github/copilot-sdk`, `@github/copilot-darwin-arm64`,
+  `@vscode/copilot-api`, and `@github/copilot` and `@github/copilot-sdk`
+  nested under `node_modules/ai-provider-bridge/`.
+- Core files referencing them: `@github/copilot` and `@vscode/copilot-api`
+  only in `out/vs/platform/agentHost/node/agentHostMain.js`.
+- The build fails if any of them, or any extension or module with "copilot"
+  in its name, remains (run 8 failed on exactly this before the removal was
+  widened).
+- The server still starts: `positron-server --help` works, and started with
+  a temporary token it logged "Extension host agent listening on 50192" and
+  "Extension host agent started", answered `/version` with `200`, and showed
+  no missing-module errors.
+
+### Remaining exposure
+
+- R's own help server (above), unless `R_DISABLE_HTTPD=1` is set.
+- `node_modules/ai-provider-bridge` (Posit's AI provider bridge from the
+  `ai-lib` submodule) remains: it has no "copilot" in its name and
+  `out/server-main.js` references it, so removing it could break the server
+  at startup. The owner should decide; it would need a new start test.
+- Not inspected: `positron-supervisor`'s `kcserver` (kernel supervisor) and
+  other extensions' listeners, Python's kernel and its tools, and the
+  Jupyter sockets (protected by the HMAC key, as stated in the task).
+- The peer check trusts any process of the same uid; that is the intended
+  boundary.
+- Windows and other non-macOS/Linux platforms are unchanged (not relevant
+  here).
+
+### Artifact check
+
+Inspection run https://github.com/timroek/positron-macos-server/actions/runs/37612898808
+(`inspect.yml`) on the artifact: 1.9 GB unpacked; `extensions/` has 66
+extensions, without `copilot` and `next-edit-suggestions`; `licenses/ark/`
+present; `extensions/positron-r/resources/ark/ark` is Mach-O arm64; commit
+in `product.json` is `467ff390dd8b4ffc8972ebb84d9e05a1fd5a4fe2`.
+
+### What the owner must do
+
+- Use the new artifact from run 9 and replace the server installed from
+  run 5 under `~/.positron-server/bin/467ff390dd8b4ffc8972ebb84d9e05a1fd5a4fe2/`.
+- Set `"chat.agentHost.enabled": false` in Positron, since the agent host's
+  packages are removed.
+- Decide on `R_DISABLE_HTTPD=1` for user B (closes R's help server, loses the
+  R Help pane).
+- Decide on `ai-provider-bridge`.
+- Decide whether to send `SECURITY-NOTE.md` to Posit (not filed).
+- Test a real session: R console, LSP features (completion), the debugger
+  and the Help pane, to confirm the legitimate clients pass the check.
