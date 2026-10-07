@@ -44,6 +44,15 @@ A server build, as in `TASK.md`, whose ark rejects every TCP connection to its D
    - Write `SECURITY-NOTE.md`: a short, factual description of the issue and the fix, which the owner may decide to report to Posit.
    - Do not file it yourself.
 
+## Addition: leave out GitHub Copilot
+
+The server build must leave out the built-in GitHub Copilot Chat extension.
+Remove the folder `extensions/copilot` from `vscode-reh-darwin-arm64/` before
+packaging, and make the workflow fail if any extension folder whose name
+contains "copilot" remains. Reason: in the owner's setup every extension in the
+server runs as a user that has access to sensitive data, and no AI component may
+run on that side. Record this under "Modifications" in `README.md`.
+
 ## Constraints
 
 - **Repository:** only touch this repository. Do not open issues or pull requests on `posit-dev/ark`, `posit-dev/positron` or any other repository.

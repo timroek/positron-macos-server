@@ -231,6 +231,20 @@ jobs:
         working-directory: positron
         run: npm run gulp vscode-reh-darwin-arm64-min-ci
 
+      # No AI component may run in the server (see README.md): remove the
+      # built-in GitHub Copilot Chat extension and fail if any extension
+      # folder with "copilot" in its name is left.
+      - name: Remove the Copilot extension
+        run: |
+          OUT=vscode-reh-darwin-arm64
+          rm -rf "$OUT/extensions/copilot"
+          left=$(find "$OUT/extensions" -mindepth 1 -maxdepth 1 -type d -iname '*copilot*')
+          if [ -n "$left" ]; then
+            echo "::error::Copilot extension folders still present: $left"
+            exit 1
+          fi
+          echo "No Copilot extension folders in $OUT/extensions"
+
       - name: Package with license and notices
         run: |
           OUT=vscode-reh-darwin-arm64

@@ -54,6 +54,14 @@ What changed:
 ark's `LICENSE` and the patch are included in the build under
 `licenses/ark/`. All copyright and licence notices are kept.
 
+### No GitHub Copilot extension
+
+The built-in GitHub Copilot Chat extension (`extensions/copilot`) is removed
+from the server before packaging, and the workflow fails if any extension
+folder whose name contains "copilot" remains. Reason: in the setup this build
+is made for, every extension in the server runs as a user with access to
+sensitive data, and no AI component may run on that side.
+
 ### Build
 
 How the build differs from running `npm run gulp vscode-reh-darwin-arm64` in
