@@ -238,10 +238,14 @@ jobs:
       - name: Remove AI components
         run: |
           OUT=vscode-reh-darwin-arm64
-          echo "Core files that reference @github/copilot:"
-          grep -rl --include='*.js' '@github/copilot' "$OUT/out" || echo "(none)"
+          for ref in @github/copilot @vscode/copilot-api ai-provider-bridge; do
+            echo "Core files that reference $ref:"
+            grep -rl --include='*.js' "$ref" "$OUT/out" || echo "(none)"
+          done
           rm -rf "$OUT/extensions/copilot" "$OUT/extensions/next-edit-suggestions"
-          find "$OUT/node_modules/@github" -mindepth 1 -maxdepth 1 -iname 'copilot*' -print -exec rm -rf {} + 2>/dev/null || true
+          # Every package with "copilot" in its name, at any depth.
+          find "$OUT" -type d -path '*/node_modules/*' -iname '*copilot*' -prune \
+            -print -exec rm -rf {} +
 
           left=$( {
             find "$OUT/extensions" -mindepth 1 -maxdepth 1 \( -iname '*copilot*' -o -name next-edit-suggestions \)

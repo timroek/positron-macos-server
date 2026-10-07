@@ -60,10 +60,13 @@ Removed from the server before packaging:
 
 - `extensions/copilot`: the built-in GitHub Copilot Chat extension;
 - `extensions/next-edit-suggestions`: Posit AI next-edit suggestions;
-- `node_modules/@github/copilot*`: the GitHub Copilot packages (such as
-  `@github/copilot-darwin-arm64`), used only by the agent host
-  (`out/vs/platform/agentHost/node/agentHostMain.js`). Disable the agent host
-  in Positron with `"chat.agentHost.enabled": false`.
+- every `node_modules` package whose name contains "copilot", at any depth:
+  `@github/copilot`, `@github/copilot-sdk`, `@github/copilot-darwin-arm64`,
+  `@vscode/copilot-api`, and the `@github/copilot*` copies nested under
+  `ai-provider-bridge`. Of the core files, only the agent host
+  (`out/vs/platform/agentHost/node/agentHostMain.js`) references
+  `@github/copilot`. Disable the agent host in Positron with
+  `"chat.agentHost.enabled": false`.
 
 The workflow fails if any of these, or any extension or `node_modules`
 package whose name contains "copilot", remains. It then starts the server
