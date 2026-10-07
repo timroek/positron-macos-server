@@ -1,0 +1,745 @@
+Patch for ark (https://github.com/posit-dev/ark, MIT License) at commit
+5564f488e539cfdd344f583a7aeb40250f7d20d3 (Ark 0.1.252+266).
+
+Makes ark's DAP server, LSP server and help proxy reject TCP connections from
+processes that are not owned by the same user as ark. See README.md
+("Modifications") and SECURITY-NOTE.md in the positron-macos-server
+repository.
+
+Apply in the ark checkout with: git apply ark-peer-check.patch
+
+diff --git a/crates/ark/src/dap/dap_server.rs b/crates/ark/src/dap/dap_server.rs
+index 530c966e..922fbf19 100644
+--- a/crates/ark/src/dap/dap_server.rs
++++ b/crates/ark/src/dap/dap_server.rs
+@@ -36,6 +36,8 @@ use dap::types::*;
+ use stdext::result::ResultExt;
+ use stdext::spawn;
+ 
++use crate::peer_check;
++
+ use super::dap_state::Breakpoint;
+ use super::dap_state::BreakpointEntry;
+ use super::dap_state::BreakpointState;
+@@ -789,6 +791,17 @@ pub fn start_dap(
+ 
+         let stream = match listener.accept() {
+             Ok((stream, addr)) => {
++                // Only serve clients owned by the same user as ark. Other
++                // local users could otherwise evaluate R code in this session.
++                let allowed = match stream.local_addr() {
++                    Ok(local) => peer_check::is_same_user_peer("DAP", local, addr),
++                    Err(err) => peer_check::reject_unknown_peer("DAP", err),
++                };
++                if !allowed {
++                    drop(stream);
++                    continue;
++                }
++
+                 log::info!("DAP: Connected to client {addr:?}");
+ 
+                 let mut state = state.lock().unwrap();
+diff --git a/crates/ark/src/help_proxy.rs b/crates/ark/src/help_proxy.rs
+index 8a393025..149c56b4 100644
+--- a/crates/ark/src/help_proxy.rs
++++ b/crates/ark/src/help_proxy.rs
+@@ -7,9 +7,15 @@
+ 
+ use std::time::Duration;
+ 
++use actix_web::body::MessageBody;
++use actix_web::dev::Extensions;
++use actix_web::dev::ServiceRequest;
++use actix_web::dev::ServiceResponse;
+ use actix_web::get;
+ use actix_web::http::header::ContentType;
+ use actix_web::http::uri::PathAndQuery;
++use actix_web::middleware::from_fn;
++use actix_web::middleware::Next;
+ use actix_web::web;
+ use actix_web::App;
+ use actix_web::HttpRequest;
+@@ -66,11 +72,13 @@ pub fn start(target_port: u16) -> anyhow::Result<(u16, ProxyHandle)> {
+ 
+         let server = HttpServer::new(move || {
+             App::new()
++                .wrap(from_fn(reject_other_users))
+                 .app_data(web::Data::new(AppState { target_port }))
+                 .service(preview_rd)
+                 .service(preview_img)
+                 .default_service(web::to(proxy_request))
+         })
++        .on_connect(check_peer)
+         .bind(address)?
+         .workers(1);
+ 
+@@ -134,6 +142,44 @@ pub fn start(target_port: u16) -> anyhow::Result<(u16, ProxyHandle)> {
+     }
+ }
+ 
++/// Result of the peer check, stored per connection by [`check_peer()`].
++#[derive(Clone, Copy)]
++struct SameUserPeer(bool);
++
++/// Checks, once per connection, that the client is owned by the same user as
++/// ark. The proxy serves files from the R session, so other local users must
++/// not reach it.
++fn check_peer(connection: &dyn std::any::Any, data: &mut Extensions) {
++    let allowed = match connection.downcast_ref::<actix_web::rt::net::TcpStream>() {
++        Some(stream) => match (stream.local_addr(), stream.peer_addr()) {
++            (Ok(local), Ok(peer)) => crate::peer_check::is_same_user_peer("Help proxy", local, peer),
++            (Err(err), _) | (_, Err(err)) => {
++                crate::peer_check::reject_unknown_peer("Help proxy", err)
++            },
++        },
++        None => crate::peer_check::reject_unknown_peer("Help proxy", "not a TCP connection"),
++    };
++    data.insert(SameUserPeer(allowed));
++}
++
++/// Answers `403 Forbidden` to every request on a connection that failed the
++/// peer check (or was never checked).
++async fn reject_other_users<B: MessageBody + 'static>(
++    req: ServiceRequest,
++    next: Next<B>,
++) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
++    let allowed = req
++        .conn_data::<SameUserPeer>()
++        .is_some_and(|peer| peer.0);
++    if allowed {
++        Ok(next.call(req).await?.map_into_left_body())
++    } else {
++        Ok(req
++            .into_response(HttpResponse::Forbidden().finish())
++            .map_into_right_body())
++    }
++}
++
+ // Proxies a request.
+ async fn proxy_request(req: HttpRequest, app_state: web::Data<AppState>) -> HttpResponse {
+     let target_port = app_state.target_port;
+@@ -315,3 +361,54 @@ fn convert_header_value(x: &reqwest::header::HeaderValue) -> actix_web::http::he
+ 
+     out
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::io::Read;
++    use std::io::Write;
++    use std::net::TcpListener;
++    use std::net::TcpStream;
++    use std::time::Duration;
++    use std::time::Instant;
++
++    fn status_line(port: u16, path: &str) -> String {
++        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
++        write!(stream, "GET {path} HTTP/1.0\r\n\r\n").unwrap();
++        let mut response = String::new();
++        stream.read_to_string(&mut response).unwrap();
++        response.lines().next().unwrap_or_default().to_string()
++    }
++
++    #[test]
++    fn test_help_proxy_serves_same_user() {
++        // The proxy target accepts but never answers; the request below
++        // fails before reaching it anyway.
++        let target = TcpListener::bind("127.0.0.1:0").unwrap();
++        let (port, _handle) = super::start(target.local_addr().unwrap().port()).unwrap();
++
++        // The file doesn't exist, so the handler answers 502. A rejected
++        // connection would get 403 before reaching the handler.
++        let status = status_line(port, "/dev-figure?file=/nonexistent/ark-peer-check.png");
++        assert!(status.contains(" 502 "), "unexpected status: {status}");
++    }
++
++    /// Run by the build workflow: `ARK_HELP_PROXY_PORT_FILE=<file>` starts the
++    /// proxy, writes its port to the file and keeps it running until
++    /// `<file>.done` exists, so requests from other users can be made.
++    #[test]
++    fn test_help_proxy_from_env() {
++        let Ok(port_file) = std::env::var("ARK_HELP_PROXY_PORT_FILE") else {
++            return;
++        };
++        let target = TcpListener::bind("127.0.0.1:0").unwrap();
++        let (port, _handle) = super::start(target.local_addr().unwrap().port()).unwrap();
++        std::fs::write(&port_file, port.to_string()).unwrap();
++
++        let done = format!("{port_file}.done");
++        let start = Instant::now();
++        while !std::path::Path::new(&done).exists() {
++            assert!(start.elapsed() < Duration::from_secs(300), "timed out");
++            std::thread::sleep(Duration::from_millis(200));
++        }
++    }
++}
+diff --git a/crates/ark/src/lib.rs b/crates/ark/src/lib.rs
+index 02e367e4..7965698c 100644
+--- a/crates/ark/src/lib.rs
++++ b/crates/ark/src/lib.rs
+@@ -31,6 +31,7 @@ pub mod lsp;
+ pub mod methods;
+ pub mod modules;
+ pub mod modules_utils;
++pub mod peer_check;
+ pub mod plots;
+ pub mod r_task;
+ pub mod repos;
+diff --git a/crates/ark/src/lsp/backend.rs b/crates/ark/src/lsp/backend.rs
+index 3380112b..990e6d66 100644
+--- a/crates/ark/src/lsp/backend.rs
++++ b/crates/ark/src/lsp/backend.rs
+@@ -582,8 +582,19 @@ pub(crate) fn start_lsp(
+             .context("LSP: Can't send server started notification")
+             .log_err();
+ 
+-        log::trace!("LSP: Waiting for client");
+-        let (stream, address) = listener.accept().await.unwrap();
++        // Only serve a client owned by the same user as ark. Connections
++        // from other local users are dropped and we keep waiting.
++        let (stream, address) = loop {
++            log::trace!("LSP: Waiting for client");
++            let (stream, address) = listener.accept().await.unwrap();
++            let allowed = match stream.local_addr() {
++                Ok(local) => crate::peer_check::is_same_user_peer("LSP", local, address),
++                Err(err) => crate::peer_check::reject_unknown_peer("LSP", err),
++            };
++            if allowed {
++                break (stream, address);
++            }
++        };
+         log::trace!("LSP: Connected to client: '{address}'");
+         let (read, write) = tokio::io::split(stream);
+ 
+diff --git a/crates/ark/src/peer_check.rs b/crates/ark/src/peer_check.rs
+new file mode 100644
+index 00000000..90368255
+--- /dev/null
++++ b/crates/ark/src/peer_check.rs
+@@ -0,0 +1,526 @@
++//
++// peer_check.rs
++//
++// Added by the positron-macos-server build; not part of upstream ark.
++// Licensed under the MIT License, like the rest of ark.
++//
++
++//! Checks that a TCP connection to one of ark's loopback listeners comes from
++//! a process owned by the same user as ark.
++//!
++//! The DAP, LSP and help proxy servers listen on `127.0.0.1` without any
++//! authentication, so on a multi-user machine any local user could connect to
++//! them. Right after `accept()`, the listener calls [`is_same_user_peer()`]
++//! and drops the connection unless the client socket is owned by ark's own
++//! effective user. Every error fails closed.
++//!
++//! The check looks for the client end of the connection: a TCP socket whose
++//! local address is the accepted connection's peer address and whose remote
++//! address is the listener's address.
++//!
++//! - macOS: TCP has no `SO_PEERCRED`, so the sockets of all processes owned by
++//!   the current user are enumerated with libproc. Sockets of other users'
++//!   processes cannot be inspected, and are never matched.
++//! - Linux: `/proc/net/tcp` and `/proc/net/tcp6` list the owning uid of every
++//!   TCP socket.
++//! - Other platforms: no check is available; connections are accepted as
++//!   before.
++
++use std::net::IpAddr;
++use std::net::SocketAddr;
++
++/// Returns `true` if the TCP connection accepted on `local` from `peer`
++/// belongs to a process owned by the current effective user. Logs and returns
++/// `false` on rejection and on any error.
++pub fn is_same_user_peer(server: &str, local: SocketAddr, peer: SocketAddr) -> bool {
++    match peer_matches_current_user(local, peer) {
++        Ok(true) => true,
++        Ok(false) => {
++            log::warn!(
++                "{server}: Rejected connection from {peer}: \
++                 the client socket is not owned by the current user"
++            );
++            false
++        },
++        Err(err) => {
++            log::error!("{server}: Rejected connection from {peer}: peer check failed: {err:?}");
++            false
++        },
++    }
++}
++
++/// Same as [`is_same_user_peer()`] for a connection whose addresses could not
++/// be determined. Always rejects, so callers can fail closed.
++pub fn reject_unknown_peer(server: &str, err: impl std::fmt::Debug) -> bool {
++    log::error!("{server}: Rejected connection: can't determine socket addresses: {err:?}");
++    false
++}
++
++/// Normalises IPv4-mapped IPv6 addresses so both stacks compare equal.
++fn canonical(addr: SocketAddr) -> SocketAddr {
++    match addr.ip() {
++        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
++            Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
++            None => addr,
++        },
++        IpAddr::V4(_) => addr,
++    }
++}
++
++#[cfg(target_os = "macos")]
++fn peer_matches_current_user(local: SocketAddr, peer: SocketAddr) -> anyhow::Result<bool> {
++    macos::current_user_has_socket(canonical(peer), canonical(local))
++}
++
++#[cfg(target_os = "linux")]
++fn peer_matches_current_user(local: SocketAddr, peer: SocketAddr) -> anyhow::Result<bool> {
++    let uid = unsafe { libc::geteuid() };
++    linux::socket_owned_by(canonical(peer), canonical(local), uid)
++}
++
++#[cfg(not(any(target_os = "macos", target_os = "linux")))]
++fn peer_matches_current_user(_local: SocketAddr, _peer: SocketAddr) -> anyhow::Result<bool> {
++    Ok(true)
++}
++
++#[cfg(target_os = "macos")]
++mod macos {
++    use std::mem::size_of;
++    use std::net::IpAddr;
++    use std::net::Ipv4Addr;
++    use std::net::Ipv6Addr;
++    use std::net::SocketAddr;
++
++    use anyhow::anyhow;
++
++    // From <sys/proc_info.h> and <libproc.h>. `libc` provides the functions
++    // but not the socket info structures.
++    const PROC_UID_ONLY: u32 = 4;
++    const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
++    const SOCKINFO_TCP: libc::c_int = 2;
++    const INI_IPV4: u8 = 0x1;
++    const INI_IPV6: u8 = 0x2;
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    struct ProcFileInfo {
++        fi_openflags: u32,
++        fi_status: u32,
++        fi_offset: i64,
++        fi_type: i32,
++        fi_guardflags: u32,
++    }
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    struct VinfoStat {
++        vst_dev: u32,
++        vst_mode: u16,
++        vst_nlink: u16,
++        vst_ino: u64,
++        vst_uid: u32,
++        vst_gid: u32,
++        vst_atime: i64,
++        vst_atimensec: i64,
++        vst_mtime: i64,
++        vst_mtimensec: i64,
++        vst_ctime: i64,
++        vst_ctimensec: i64,
++        vst_birthtime: i64,
++        vst_birthtimensec: i64,
++        vst_size: i64,
++        vst_blocks: i64,
++        vst_blksize: i32,
++        vst_flags: u32,
++        vst_gen: u32,
++        vst_rdev: u32,
++        vst_qspare: [i64; 2],
++    }
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    struct SockbufInfo {
++        sbi_cc: u32,
++        sbi_hiwat: u32,
++        sbi_mbcnt: u32,
++        sbi_mbmax: u32,
++        sbi_lowat: u32,
++        sbi_flags: i16,
++        sbi_timeo: i16,
++    }
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    struct In4In6Addr {
++        i46a_pad32: [u32; 3],
++        i46a_addr4: [u8; 4],
++    }
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    union InAddr46 {
++        ina_46: In4In6Addr,
++        ina_6: [u8; 16],
++    }
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    struct InSockinfoV4 {
++        in4_tos: u8,
++    }
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    struct InSockinfoV6 {
++        in6_hlim: u8,
++        in6_cksum: i32,
++        in6_ifindex: u16,
++        in6_hops: i16,
++    }
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    struct InSockinfo {
++        insi_fport: i32,
++        insi_lport: i32,
++        insi_gencnt: u64,
++        insi_flags: u32,
++        insi_flow: u32,
++        insi_vflag: u8,
++        insi_ip_ttl: u8,
++        rfu_1: u32,
++        insi_faddr: InAddr46,
++        insi_laddr: InAddr46,
++        insi_v4: InSockinfoV4,
++        insi_v6: InSockinfoV6,
++    }
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    struct TcpSockinfo {
++        tcpsi_ini: InSockinfo,
++        tcpsi_state: i32,
++        tcpsi_timer: [i32; 4],
++        tcpsi_mss: i32,
++        tcpsi_flags: u32,
++        rfu_1: u32,
++        tcpsi_tp: u64,
++    }
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    union SoiProto {
++        pri_in: InSockinfo,
++        pri_tcp: TcpSockinfo,
++        // Covers the largest member (`un_sockinfo`, 528 bytes) with room to
++        // spare. Passing a larger buffer than the kernel's struct is fine.
++        _pad: [u64; 128],
++    }
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    struct SocketInfo {
++        soi_stat: VinfoStat,
++        soi_so: u64,
++        soi_pcb: u64,
++        soi_type: i32,
++        soi_protocol: i32,
++        soi_family: i32,
++        soi_options: i16,
++        soi_linger: i16,
++        soi_state: i16,
++        soi_qlen: i16,
++        soi_incqlen: i16,
++        soi_qlimit: i16,
++        soi_timeo: i16,
++        soi_error: u16,
++        soi_oobmark: u32,
++        soi_rcv: SockbufInfo,
++        soi_snd: SockbufInfo,
++        soi_kind: i32,
++        rfu_1: u32,
++        soi_proto: SoiProto,
++    }
++
++    #[repr(C)]
++    #[derive(Copy, Clone)]
++    struct SocketFdInfo {
++        pfi: ProcFileInfo,
++        psi: SocketInfo,
++    }
++
++    fn last_os_error(what: &str) -> anyhow::Error {
++        anyhow!("{what}: {}", std::io::Error::last_os_error())
++    }
++
++    fn pids_of_user(uid: libc::uid_t) -> anyhow::Result<Vec<libc::pid_t>> {
++        // Grow the buffer until it is larger than the result, so a process
++        // started between the two calls can't be missed silently.
++        let mut capacity = 1024usize;
++        loop {
++            let mut pids: Vec<libc::pid_t> = vec![0; capacity];
++            let bytes = unsafe {
++                libc::proc_listpids(
++                    PROC_UID_ONLY,
++                    uid,
++                    pids.as_mut_ptr().cast(),
++                    (capacity * size_of::<libc::pid_t>()) as libc::c_int,
++                )
++            };
++            if bytes < 0 {
++                return Err(last_os_error("proc_listpids"));
++            }
++            let count = bytes as usize / size_of::<libc::pid_t>();
++            if count < capacity {
++                pids.truncate(count);
++                pids.retain(|pid| *pid > 0);
++                return Ok(pids);
++            }
++            capacity *= 2;
++        }
++    }
++
++    fn socket_fds_of(pid: libc::pid_t) -> Option<Vec<i32>> {
++        let mut capacity = 256usize;
++        loop {
++            let mut fds: Vec<libc::proc_fdinfo> = vec![
++                libc::proc_fdinfo {
++                    proc_fd: 0,
++                    proc_fdtype: 0,
++                };
++                capacity
++            ];
++            let bytes = unsafe {
++                libc::proc_pidinfo(
++                    pid,
++                    libc::PROC_PIDLISTFDS,
++                    0,
++                    fds.as_mut_ptr().cast(),
++                    (capacity * size_of::<libc::proc_fdinfo>()) as libc::c_int,
++                )
++            };
++            // The process may have exited, or may not be inspectable.
++            if bytes <= 0 {
++                return None;
++            }
++            let count = bytes as usize / size_of::<libc::proc_fdinfo>();
++            if count < capacity {
++                fds.truncate(count);
++                return Some(
++                    fds.iter()
++                        .filter(|fd| fd.proc_fdtype as libc::c_int == libc::PROX_FDTYPE_SOCKET)
++                        .map(|fd| fd.proc_fd)
++                        .collect(),
++                );
++            }
++            capacity *= 2;
++        }
++    }
++
++    fn tcp_endpoints(pid: libc::pid_t, fd: i32) -> Option<(SocketAddr, SocketAddr)> {
++        let mut info: SocketFdInfo = unsafe { std::mem::zeroed() };
++        let bytes = unsafe {
++            libc::proc_pidfdinfo(
++                pid,
++                fd,
++                PROC_PIDFDSOCKETINFO,
++                (&mut info as *mut SocketFdInfo).cast(),
++                size_of::<SocketFdInfo>() as libc::c_int,
++            )
++        };
++        if bytes <= 0 || info.psi.soi_kind != SOCKINFO_TCP {
++            return None;
++        }
++
++        let ini = unsafe { info.psi.soi_proto.pri_tcp.tcpsi_ini };
++        // Ports are stored in network byte order in the low 16 bits.
++        let lport = u16::from_be(ini.insi_lport as u16);
++        let fport = u16::from_be(ini.insi_fport as u16);
++        let (laddr, faddr) = if ini.insi_vflag & INI_IPV4 != 0 {
++            let l = unsafe { ini.insi_laddr.ina_46.i46a_addr4 };
++            let f = unsafe { ini.insi_faddr.ina_46.i46a_addr4 };
++            (IpAddr::V4(Ipv4Addr::from(l)), IpAddr::V4(Ipv4Addr::from(f)))
++        } else if ini.insi_vflag & INI_IPV6 != 0 {
++            let l = unsafe { ini.insi_laddr.ina_6 };
++            let f = unsafe { ini.insi_faddr.ina_6 };
++            (IpAddr::V6(Ipv6Addr::from(l)), IpAddr::V6(Ipv6Addr::from(f)))
++        } else {
++            return None;
++        };
++
++        Some((
++            super::canonical(SocketAddr::new(laddr, lport)),
++            super::canonical(SocketAddr::new(faddr, fport)),
++        ))
++    }
++
++    /// Does any process of the current effective user own a TCP socket with
++    /// local address `client` connected to `server`?
++    pub(super) fn current_user_has_socket(
++        client: SocketAddr,
++        server: SocketAddr,
++    ) -> anyhow::Result<bool> {
++        let uid = unsafe { libc::geteuid() };
++        for pid in pids_of_user(uid)? {
++            let Some(fds) = socket_fds_of(pid) else {
++                continue;
++            };
++            for fd in fds {
++                if tcp_endpoints(pid, fd) == Some((client, server)) {
++                    return Ok(true);
++                }
++            }
++        }
++        Ok(false)
++    }
++}
++
++#[cfg(target_os = "linux")]
++mod linux {
++    use std::net::IpAddr;
++    use std::net::Ipv4Addr;
++    use std::net::Ipv6Addr;
++    use std::net::SocketAddr;
++
++    use anyhow::anyhow;
++    use anyhow::Context;
++
++    /// Parses an address such as `0100007F:1F90` from `/proc/net/tcp{,6}`.
++    fn parse_proc_addr(field: &str) -> anyhow::Result<SocketAddr> {
++        let (ip, port) = field
++            .split_once(':')
++            .ok_or_else(|| anyhow!("malformed address {field:?}"))?;
++        let port = u16::from_str_radix(port, 16)?;
++        let ip = match ip.len() {
++            8 => {
++                let word = u32::from_str_radix(ip, 16)?;
++                IpAddr::V4(Ipv4Addr::from(word.to_ne_bytes()))
++            },
++            32 => {
++                let mut bytes = [0u8; 16];
++                for i in 0..4 {
++                    let word = u32::from_str_radix(&ip[i * 8..i * 8 + 8], 16)?;
++                    bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_ne_bytes());
++                }
++                IpAddr::V6(Ipv6Addr::from(bytes))
++            },
++            _ => return Err(anyhow!("malformed address {field:?}")),
++        };
++        Ok(super::canonical(SocketAddr::new(ip, port)))
++    }
++
++    /// Finds the owner of the socket with local address `client` connected to
++    /// `server` in a `/proc/net/tcp`-formatted table.
++    pub(super) fn find_owner(
++        table: &str,
++        client: SocketAddr,
++        server: SocketAddr,
++    ) -> anyhow::Result<Option<u32>> {
++        for line in table.lines().skip(1) {
++            let fields: Vec<&str> = line.split_whitespace().collect();
++            if fields.len() < 8 {
++                continue;
++            }
++            if parse_proc_addr(fields[1])? == client && parse_proc_addr(fields[2])? == server {
++                return Ok(Some(fields[7].parse()?));
++            }
++        }
++        Ok(None)
++    }
++
++    pub(super) fn socket_owned_by(
++        client: SocketAddr,
++        server: SocketAddr,
++        uid: u32,
++    ) -> anyhow::Result<bool> {
++        for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
++            let table = match std::fs::read_to_string(path) {
++                Ok(table) => table,
++                // `tcp6` is missing when IPv6 is disabled.
++                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
++                Err(err) => return Err(err).with_context(|| format!("reading {path}")),
++            };
++            if let Some(owner) = find_owner(&table, client, server)? {
++                return Ok(owner == uid);
++            }
++        }
++        Ok(false)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::net::Ipv4Addr;
++    use std::net::SocketAddr;
++    use std::net::TcpListener;
++    use std::net::TcpStream;
++
++    use super::*;
++
++    #[test]
++    fn test_accepts_connection_from_same_process() {
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++        let (stream, peer) = listener.accept().unwrap();
++        let local = stream.local_addr().unwrap();
++        assert!(is_same_user_peer("test", local, peer));
++    }
++
++    #[cfg(any(target_os = "macos", target_os = "linux"))]
++    #[test]
++    fn test_rejects_unknown_peer_port() {
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++        let (stream, peer) = listener.accept().unwrap();
++        let local = stream.local_addr().unwrap();
++
++        // A peer port that has no socket connected to the listener. Port 1
++        // can't be a client port of an unprivileged process.
++        let unknown = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1);
++        assert!(!is_same_user_peer("test", local, unknown));
++
++        // The real peer, but claimed on another listener port.
++        let other = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), local.port().wrapping_add(1));
++        assert!(!is_same_user_peer("test", other, peer));
++    }
++
++    /// Run by the build workflow with a real client in another process:
++    /// `ARK_PEER_CHECK_LISTEN_FILE=<file>` makes this test listen, write its
++    /// port to the file and accept one connection. The connection must be
++    /// accepted if `ARK_PEER_CHECK_EXPECT=accept` (client of the same user)
++    /// and rejected otherwise (client of another user). Without the variable
++    /// the test does nothing.
++    #[test]
++    fn test_peer_from_env() {
++        let Ok(port_file) = std::env::var("ARK_PEER_CHECK_LISTEN_FILE") else {
++            return;
++        };
++        let expect_accept = std::env::var("ARK_PEER_CHECK_EXPECT").as_deref() == Ok("accept");
++
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        let port = listener.local_addr().unwrap().port();
++        std::fs::write(&port_file, port.to_string()).unwrap();
++        let (stream, peer) = listener.accept().unwrap();
++        let local = stream.local_addr().unwrap();
++        assert_eq!(is_same_user_peer("test", local, peer), expect_accept);
++    }
++
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn test_linux_find_owner() {
++        let table = "\
++  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
++   0: 0100007F:D431 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 1 1 0 20 4 30 10 -1
++   1: 0100007F:1F90 0100007F:D431 01 00000000:00000000 00:00000000 00000000   501        0 2 1 0 20 4 30 10 -1
++";
++        let client: SocketAddr = "127.0.0.1:54321".parse().unwrap();
++        let server: SocketAddr = "127.0.0.1:8080".parse().unwrap();
++        assert_eq!(
++            linux::find_owner(table, client, server).unwrap(),
++            Some(1000)
++        );
++        assert_eq!(linux::find_owner(table, server, client).unwrap(), Some(501));
++        let other: SocketAddr = "127.0.0.1:1".parse().unwrap();
++        assert_eq!(linux::find_owner(table, other, server).unwrap(), None);
++    }
++}

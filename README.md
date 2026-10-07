@@ -11,13 +11,55 @@ is also included in every build.
 
 ## Modifications
 
-No changes to the Positron source. The workflow checks out
+The Positron source itself is not changed. The workflow checks out
 `posit-dev/positron` at the requested commit and runs Positron's own gulp
-tasks. Any change to the Positron source needed to make the build work will be
-listed here, with what was changed and why.
+tasks. The R kernel **ark**, which Positron includes as a git submodule
+(`extensions/positron-r/ark`, `posit-dev/ark`, MIT licence), is modified as
+described below.
+
+### ark: listeners only accept connections from the same user
+
+File: `patches/ark-peer-check.patch`, applied to ark commit `5564f48`
+(Ark 0.1.252+266) before ark is built from source on the macOS runner. The
+built binary replaces the prebuilt `extensions/positron-r/resources/ark/ark`
+and is signed ad hoc (`codesign -s -`).
+
+Why: ark opens a DAP server, an LSP server and an HTTP help proxy on
+`127.0.0.1` without authentication. On a Mac with several user accounts, any
+local user could connect to them. Through the DAP server they could run
+R code as the user who owns the R session, and through the help proxy they
+could read that user's files. See `SECURITY-NOTE.md`.
+
+What changed:
+
+- New module `crates/ark/src/peer_check.rs`. After `accept()`, it checks that
+  the client end of the connection is a TCP socket owned by a process of the
+  same user as ark. On macOS it enumerates the user's processes and their
+  sockets with libproc (`proc_listpids`, `proc_pidinfo(PROC_PIDLISTFDS)`,
+  `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`). On Linux it reads the socket owner
+  from `/proc/net/tcp` and `/proc/net/tcp6`. Any error rejects the
+  connection. Other platforms keep the original behaviour.
+- DAP server (`crates/ark/src/dap/dap_server.rs`): connections that fail the
+  check are closed and logged; the accept loop continues, so the legitimate
+  client can still reconnect.
+- LSP server (`crates/ark/src/lsp/backend.rs`): keeps accepting until a
+  connection passes the check, instead of serving the first connection.
+- Help proxy (`crates/ark/src/help_proxy.rs`): the check runs once per
+  connection, and every request on a connection that fails it gets
+  `403 Forbidden`.
+- Tests: unit tests for the check and the help proxy, and CI tests with real
+  connections from another process: accepted from the same user, rejected
+  from the `nobody` user (for the help proxy: `200` versus `403`).
+
+ark's `LICENSE` and the patch are included in the build under
+`licenses/ark/`. All copyright and licence notices are kept.
+
+### Build
 
 How the build differs from running `npm run gulp vscode-reh-darwin-arm64` in
 one go:
+
+- ark is patched and built from source (see above).
 
 - The TypeScript compile of `src/` (`compile-build-without-mangling`) runs on
   a Linux runner with a 12 GB JavaScript heap, and its output (`out-build/`)

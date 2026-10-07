@@ -112,6 +112,79 @@ jobs:
         working-directory: positron/extensions/positron-r/ark
         run: git fetch --unshallow --tags || git fetch --tags
 
+      # Patch ark so its DAP, LSP and help proxy listeners only accept
+      # connections from processes of the same user (see README.md and
+      # SECURITY-NOTE.md). Positron's install script copies a local
+      # `target/release/ark` build in place of the prebuilt binary.
+      - name: Apply the ark peer-check patch
+        working-directory: positron/extensions/positron-r/ark
+        run: |
+          git apply --verbose "$GITHUB_WORKSPACE/notices/patches/ark-peer-check.patch"
+          git status --short
+
+      - name: Test the ark peer check
+        working-directory: positron/extensions/positron-r/ark
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ark-test-target
+        run: |
+          cargo test -p ark --lib peer_check -- --test-threads=1
+          cargo test -p ark --lib help_proxy -- --test-threads=1
+
+          T="$RUNNER_TEMP/peer-check"
+          mkdir -p "$T"
+          chmod 755 "$T"
+          wait_for_port() {
+            for _ in $(seq 1 300); do [ -s "$1" ] && return 0; sleep 1; done
+            echo "No port in $1"; return 1
+          }
+
+          # DAP/LSP-style listener: a real connection from another process
+          # must be accepted from the same user and rejected from `nobody`.
+          for case in accept:runner reject:nobody; do
+            expect=${case%%:*}; user=${case##*:}
+            rm -f "$T/port"
+            ARK_PEER_CHECK_LISTEN_FILE="$T/port" ARK_PEER_CHECK_EXPECT=$expect \
+              cargo test -p ark --lib peer_check::tests::test_peer_from_env -- --exact --nocapture &
+            test_pid=$!
+            wait_for_port "$T/port"
+            as=(); [ "$user" = nobody ] && as=(sudo -u nobody)
+            "${as[@]}" perl -MIO::Socket::INET -e \
+              '$s = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $ARGV[0]) or die "connect: $!"; sleep 10' \
+              "$(cat "$T/port")" &
+            wait "$test_pid"
+            echo "Connection from $user: ${expect}ed as expected"
+          done
+
+          # Help proxy: a file readable by both users is served to the same
+          # user and refused (403) to `nobody`.
+          echo "peer check" > "$T/probe.txt"
+          chmod 644 "$T/probe.txt"
+          rm -f "$T/port" "$T/port.done"
+          ARK_HELP_PROXY_PORT_FILE="$T/port" \
+            cargo test -p ark --lib help_proxy::tests::test_help_proxy_from_env -- --exact &
+          test_pid=$!
+          wait_for_port "$T/port"
+          url="http://127.0.0.1:$(cat "$T/port")/dev-figure?file=$T/probe.txt"
+          same=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' "$url")
+          other=$(sudo -u nobody curl -s --noproxy '*' -o /dev/null -w '%{http_code}' "$url")
+          touch "$T/port.done"
+          wait "$test_pid"
+          echo "Help proxy: same user $same, nobody $other"
+          [ "$same" = 200 ] && [ "$other" = 403 ]
+
+      - name: Build the patched ark
+        working-directory: positron/extensions/positron-r/ark
+        run: |
+          # Report the same version as the prebuild for this commit
+          # (`<version>+<distance>.<sha>`), as Positron's install script does.
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/ark/Cargo.toml | head -1)
+          distance=$(git rev-list --count "$(git describe --tags --abbrev=0)"..HEAD)
+          export ARK_BUILD_VERSION="$version+$distance"
+          cargo build --release -p ark --bin ark
+          codesign --force --sign - target/release/ark
+          file target/release/ark
+          target/release/ark --version
+
       - uses: actions/setup-node@v4
         with:
           node-version-file: positron/.nvmrc
@@ -161,6 +234,15 @@ jobs:
       - name: Package with license and notices
         run: |
           OUT=vscode-reh-darwin-arm64
+          ARK="$OUT/extensions/positron-r/resources/ark/ark"
+          # The server must ship the patched ark built above.
+          cmp positron/extensions/positron-r/ark/target/release/ark "$ARK"
+          codesign --force --sign - "$ARK"
+          codesign --verify --verbose "$ARK"
+          "$ARK" --version
+          mkdir -p "$OUT/licenses/ark"
+          cp positron/extensions/positron-r/ark/LICENSE* "$OUT/licenses/ark/"
+          cp notices/patches/ark-peer-check.patch "$OUT/licenses/ark/"
           cp positron/LICENSE.txt "$OUT/LICENSE.txt"
           cp notices/README.md "$OUT/BUILD-NOTICE.md"
           tar -czf positron-reh-darwin-arm64-${{ inputs.commit }}.tar.gz "$OUT"
