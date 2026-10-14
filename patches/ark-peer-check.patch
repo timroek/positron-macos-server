@@ -1,13 +1,3 @@
-Patch for ark (https://github.com/posit-dev/ark, MIT License) at commit
-5564f488e539cfdd344f583a7aeb40250f7d20d3 (Ark 0.1.252+266).
-
-Makes ark's DAP server, LSP server and help proxy reject TCP connections from
-processes that are not owned by the same user as ark. See README.md
-("Modifications") and SECURITY-NOTE.md in the positron-macos-server
-repository.
-
-Apply in the ark checkout with: git apply ark-peer-check.patch
-
 diff --git a/crates/ark/src/dap/dap_server.rs b/crates/ark/src/dap/dap_server.rs
 index 530c966e..922fbf19 100644
 --- a/crates/ark/src/dap/dap_server.rs
@@ -40,31 +30,31 @@ index 530c966e..922fbf19 100644
  
                  let mut state = state.lock().unwrap();
 diff --git a/crates/ark/src/help_proxy.rs b/crates/ark/src/help_proxy.rs
-index 8a393025..149c56b4 100644
+index 10de9107..66b9b3b3 100644
 --- a/crates/ark/src/help_proxy.rs
 +++ b/crates/ark/src/help_proxy.rs
-@@ -7,9 +7,15 @@
+@@ -7,11 +7,14 @@
  
  use std::time::Duration;
  
 +use actix_web::body::MessageBody;
 +use actix_web::dev::Extensions;
-+use actix_web::dev::ServiceRequest;
-+use actix_web::dev::ServiceResponse;
+ use actix_web::dev::ServiceRequest;
+ use actix_web::dev::ServiceResponse;
  use actix_web::get;
  use actix_web::http::header::ContentType;
  use actix_web::http::uri::PathAndQuery;
 +use actix_web::middleware::from_fn;
-+use actix_web::middleware::Next;
+ use actix_web::middleware::Next;
  use actix_web::web;
  use actix_web::App;
- use actix_web::HttpRequest;
-@@ -66,11 +72,13 @@ pub fn start(target_port: u16) -> anyhow::Result<(u16, ProxyHandle)> {
+@@ -71,12 +74,14 @@ pub fn start(target_port: u16) -> anyhow::Result<(u16, ProxyHandle)> {
  
          let server = HttpServer::new(move || {
              App::new()
 +                .wrap(from_fn(reject_other_users))
                  .app_data(web::Data::new(AppState { target_port }))
+                 .wrap(actix_web::middleware::from_fn(catch_panics))
                  .service(preview_rd)
                  .service(preview_img)
                  .default_service(web::to(proxy_request))
@@ -73,7 +63,7 @@ index 8a393025..149c56b4 100644
          .bind(address)?
          .workers(1);
  
-@@ -134,6 +142,44 @@ pub fn start(target_port: u16) -> anyhow::Result<(u16, ProxyHandle)> {
+@@ -163,6 +168,44 @@ async fn catch_panics<B>(
      }
  }
  
@@ -118,7 +108,7 @@ index 8a393025..149c56b4 100644
  // Proxies a request.
  async fn proxy_request(req: HttpRequest, app_state: web::Data<AppState>) -> HttpResponse {
      let target_port = app_state.target_port;
-@@ -315,3 +361,54 @@ fn convert_header_value(x: &reqwest::header::HeaderValue) -> actix_web::http::he
+@@ -344,3 +387,54 @@ fn convert_header_value(x: &reqwest::header::HeaderValue) -> actix_web::http::he
  
      out
  }
@@ -174,32 +164,43 @@ index 8a393025..149c56b4 100644
 +    }
 +}
 diff --git a/crates/ark/src/lib.rs b/crates/ark/src/lib.rs
-index 02e367e4..7965698c 100644
+index f282d3b8..c6356063 100644
 --- a/crates/ark/src/lib.rs
 +++ b/crates/ark/src/lib.rs
-@@ -31,6 +31,7 @@ pub mod lsp;
- pub mod methods;
+@@ -32,6 +32,7 @@ pub mod methods;
  pub mod modules;
  pub mod modules_utils;
+ pub mod panic;
 +pub mod peer_check;
  pub mod plots;
  pub mod r_task;
  pub mod repos;
 diff --git a/crates/ark/src/lsp/backend.rs b/crates/ark/src/lsp/backend.rs
-index 3380112b..990e6d66 100644
+index 955ad48d..c511121e 100644
 --- a/crates/ark/src/lsp/backend.rs
 +++ b/crates/ark/src/lsp/backend.rs
-@@ -582,8 +582,19 @@ pub(crate) fn start_lsp(
+@@ -681,13 +681,24 @@ pub(crate) fn start_lsp(
              .context("LSP: Can't send server started notification")
              .log_err();
  
 -        log::trace!("LSP: Waiting for client");
--        let (stream, address) = listener.accept().await.unwrap();
+-        let (stream, address) = match listener.accept().await {
+-            Ok(connection) => connection,
+-            Err(err) => {
+-                log::error!("LSP: Failed to accept a client connection: {err:?}");
+-                return;
+-            },
 +        // Only serve a client owned by the same user as ark. Connections
 +        // from other local users are dropped and we keep waiting.
 +        let (stream, address) = loop {
 +            log::trace!("LSP: Waiting for client");
-+            let (stream, address) = listener.accept().await.unwrap();
++            let (stream, address) = match listener.accept().await {
++                Ok(connection) => connection,
++                Err(err) => {
++                    log::error!("LSP: Failed to accept a client connection: {err:?}");
++                    return;
++                },
++            };
 +            let allowed = match stream.local_addr() {
 +                Ok(local) => crate::peer_check::is_same_user_peer("LSP", local, address),
 +                Err(err) => crate::peer_check::reject_unknown_peer("LSP", err),
@@ -207,10 +208,9 @@ index 3380112b..990e6d66 100644
 +            if allowed {
 +                break (stream, address);
 +            }
-+        };
+         };
          log::trace!("LSP: Connected to client: '{address}'");
          let (read, write) = tokio::io::split(stream);
- 
 diff --git a/crates/ark/src/peer_check.rs b/crates/ark/src/peer_check.rs
 new file mode 100644
 index 00000000..90368255

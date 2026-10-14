@@ -6,11 +6,11 @@ on:
       commit:
         description: Positron commit to build (must match the installed Positron app)
         required: true
-        default: 467ff390dd8b4ffc8972ebb84d9e05a1fd5a4fe2
+        default: 73a7e19ea8bdd7783066391a2db086c6bec55ae9
       build_number:
         description: Positron build number of that release
         required: true
-        default: "2"
+        default: "297"
 
 permissions:
   contents: read
