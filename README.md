@@ -20,7 +20,7 @@ described below.
 ### ark: listeners only accept connections from the same user
 
 File: `patches/ark-peer-check.patch`, applied to ark commit `f1af004` (Positron 2026.10.0 build 297; rebased from the version for ark `5564f48`, keeping upstream's new LSP accept error handling and help-proxy panic handler)
-(Ark 0.1.252+266) before ark is built from source on the macOS runner. The
+(Ark 0.1.252+355) before ark is built from source on the macOS runner. The
 built binary replaces the prebuilt `extensions/positron-r/resources/ark/ark`
 and is signed ad hoc (`codesign -s -`).
 
